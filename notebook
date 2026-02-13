@@ -1,0 +1,782 @@
+(cell 1)
+
+======================================================================
+📄 dman_maker_v2.py SOURCE CODE:
+======================================================================
+from decimal import Decimal
+from typing import List, Optional
+
+import pandas_ta as ta  # noqa: F401
+from pydantic import Field, field_validator
+
+from hummingbot.core.data_type.common import TradeType
+from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
+from hummingbot.strategy_v2.controllers.market_making_controller_base import (
+    MarketMakingControllerBase,
+    MarketMakingControllerConfigBase,
+)
+from hummingbot.strategy_v2.executors.dca_executor.data_types import DCAExecutorConfig, DCAMode
+from hummingbot.strategy_v2.models.executor_actions import ExecutorAction, StopExecutorAction
+
+
+class DManMakerV2Config(MarketMakingControllerConfigBase):
+    """
+    Configuration required to run the D-Man Maker V2 strategy.
+    """
+    controller_name: str = "dman_maker_v2"
+    candles_config: List[CandlesConfig] = []
+
+    # DCA configuration
+    dca_spreads: List[Decimal] = Field(
+        default="0.01,0.02,0.04,0.08",
+        json_schema_extra={"prompt": "Enter a comma-separated list of spreads for each DCA level: ", "prompt_on_new": True})
+    dca_amounts: List[Decimal] = Field(
+        default="0.1,0.2,0.4,0.8",
+        json_schema_extra={"prompt": "Enter a comma-separated list of amounts for each DCA level: ", "prompt_on_new": True})
+    top_executor_refresh_time: Optional[float] = Field(default=None, json_schema_extra={"is_updatable": True})
+    executor_activation_bounds: Optional[List[Decimal]] = Field(default=None, json_schema_extra={"is_updatable": True})
+
+    @field_validator("executor_activation_bounds", mode="before")
+    @classmethod
+    def parse_activation_bounds(cls, v):
+        if isinstance(v, list):
+            return [Decimal(val) for val in v]
+        elif isinstance(v, str):
+            if v == "":
+                return None
+            return [Decimal(val) for val in v.split(",")]
+        return v
+
+    @field_validator('dca_spreads', mode="before")
+    @classmethod
+    def parse_dca_spreads(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            if v == "":
+                return []
+            return [float(x.strip()) for x in v.split(',')]
+        return v
+
+    @field_validator('dca_amounts', mode="before")
+    @classmethod
+    def parse_and_validate_dca_amounts(cls, v, validation_info):
+        if v is None or v == "":
+            return [1 for _ in validation_info.data['dca_spreads']]
+        if isinstance(v, str):
+            return [float(x.strip()) for x in v.split(',')]
+        elif isinstance(v, list) and len(v) != len(validation_info.data['dca_spreads']):
+            raise ValueError(
+                f"The number of dca amounts must match the number of {validation_info.data['dca_spreads']}.")
+        return v
+
+
+class DManMakerV2(MarketMakingControllerBase):
+    def __init__(self, config: DManMakerV2Config, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        self.config = config
+        self.dca_amounts_pct = [Decimal(amount) / sum(self.config.dca_amounts) for amount in self.config.dca_amounts]
+        self.spreads = self.config.dca_spreads
+
+    def first_level_refresh_condition(self, executor):
+        if self.config.top_executor_refresh_time is not None:
+            if self.get_level_from_level_id(executor.custom_info["level_id"]) == 0:
+                return self.market_data_provider.time() - executor.timestamp > self.config.top_executor_refresh_time
+        return False
+
+    def order_level_refresh_condition(self, executor):
+        return self.market_data_provider.time() - executor.timestamp > self.config.executor_refresh_time
+
+    def executors_to_refresh(self) -> List[ExecutorAction]:
+        executors_to_refresh = self.filter_executors(
+            executors=self.executors_info,
+            filter_func=lambda x: not x.is_trading and x.is_active and (self.order_level_refresh_condition(x) or self.first_level_refresh_condition(x)))
+        return [StopExecutorAction(
+            controller_id=self.config.id,
+            executor_id=executor.id) for executor in executors_to_refresh]
+
+    def get_executor_config(self, level_id: str, price: Decimal, amount: Decimal):
+        trade_type = self.get_trade_type_from_level_id(level_id)
+        if trade_type == TradeType.BUY:
+            prices = [price * (1 - spread) for spread in self.spreads]
+        else:
+            prices = [price * (1 + spread) for spread in self.spreads]
+        amounts = [amount * pct for pct in self.dca_amounts_pct]
+        amounts_quote = [amount * price for amount, price in zip(amounts, prices)]
+        return DCAExecutorConfig(
+            timestamp=self.market_data_provider.time(),
+            connector_name=self.config.connector_name,
+            trading_pair=self.config.trading_pair,
+            mode=DCAMode.MAKER,
+            side=trade_type,
+            prices=prices,
+            amounts_quote=amounts_quote,
+            level_id=level_id,
+            time_limit=self.config.time_limit,
+            stop_loss=self.config.stop_loss,
+            take_profit=self.config.take_profit,
+            trailing_stop=self.config.trailing_stop,
+            activation_bounds=self.config.executor_activation_bounds,
+            leverage=self.config.leverage,
+        )
+
+(cell 2)
+
+======================================================================
+📄 core/backtesting/engine.py SOURCE CODE:
+======================================================================
+import logging
+import os
+from typing import Dict, Optional
+
+import pandas as pd
+
+from core.data_structures.backtesting_result import BacktestingResult
+from core.data_paths import data_paths
+from hummingbot.strategy_v2.backtesting.backtesting_engine_base import BacktestingEngineBase
+from hummingbot.strategy_v2.controllers import ControllerConfigBase
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class BacktestingEngine:
+    def __init__(self, load_cached_data: bool = True, custom_backtester: Optional[BacktestingEngineBase] = None):
+        self._bt_engine = custom_backtester if custom_backtester is not None else BacktestingEngineBase()
+        if load_cached_data:
+            self._load_candles_cache()
+
+    def _load_candles_cache(self):
+        # Use centralized data paths
+        candles_path = data_paths.candles_dir
+        if not candles_path.exists():
+            logger.warning(f"Candles directory {candles_path} does not exist.")
+            return
+        all_files = os.listdir(candles_path)
+        for file in all_files:
+            if file == ".gitignore":
+                continue
+            try:
+                connector_name, trading_pair, interval = file.split(".")[0].split("|")
+                candles = pd.read_parquet(candles_path / file)
+                candles.index = pd.to_datetime(candles.timestamp, unit='s')
+                candles.index.name = None
+                columns = ['open', 'high', 'low', 'close', 'volume', 'quote_asset_volume',
+                           'n_trades', 'taker_buy_base_volume', 'taker_buy_quote_volume']
+                for column in columns:
+                    candles[column] = pd.to_numeric(candles[column])
+                self._bt_engine.backtesting_data_provider.candles_feeds[
+                    f"{connector_name}_{trading_pair}_{interval}"] = candles
+                # TODO: evaluate start and end time for each feed
+                start_time = candles["timestamp"].min()
+                end_time = candles["timestamp"].max()
+                self._bt_engine.backtesting_data_provider.start_time = start_time
+                self._bt_engine.backtesting_data_provider.end_time = end_time
+            except Exception as e:
+                logger.error(f"Error loading {file}: {e}")
+
+    def load_candles_cache_by_connector_pair(self, connector_name: str, trading_pair: str):
+            # Use centralized data paths
+            candles_path = data_paths.candles_dir
+            if not candles_path.exists():
+                logger.warning(f"Candles directory {candles_path} does not exist.")
+                return
+            all_files = os.listdir(candles_path)
+            for file in all_files:
+                if file == ".gitignore":
+                    continue
+                try:
+                    if connector_name in file and trading_pair in file:
+                        connector_name, trading_pair, interval = file.split(".")[0].split("|")
+                        candles = pd.read_parquet(candles_path / file)
+                        candles.index = pd.to_datetime(candles.timestamp, unit='s')
+                        candles.index.name = None
+                        columns = ['open', 'high', 'low', 'close', 'volume', 'quote_asset_volume',
+                                   'n_trades', 'taker_buy_base_volume', 'taker_buy_quote_volume']
+                        for column in columns:
+                            candles[column] = pd.to_numeric(candles[column])
+                        self._bt_engine.backtesting_data_provider.candles_feeds[
+                            f"{connector_name}_{trading_pair}_{interval}"] = candles
+                except Exception as e:
+                    logger.error(f"Error loading {file}: {e}")
+
+    def get_controller_config_instance_from_dict(self, config: Dict):
+        return BacktestingEngineBase.get_controller_config_instance_from_dict(
+            config_data=config,
+            controllers_module="controllers",
+        )
+
+    async def run_backtesting(self, config: ControllerConfigBase, start: int,
+                              end: int, backtesting_resolution: str, trade_cost: float = 0.0006) -> BacktestingResult:
+        bt_result = await self._bt_engine.run_backtesting(config, start, end, backtesting_resolution, trade_cost)
+        return BacktestingResult(bt_result, config)
+
+    async def backtest_controller_from_yml(self,
+                                           config_file: str,
+                                           controllers_conf_dir_path: str,
+                                           start: int,
+                                           end: int,
+                                           backtesting_resolution: str = "1m",
+                                           trade_cost: float = 0.0006,
+                                           backtester: Optional[BacktestingEngineBase] = None):
+        config = self._bt_engine.get_controller_config_instance_from_yml(config_file, controllers_conf_dir_path)
+        return await self.run_backtesting(config, start, end, backtesting_resolution, trade_cost, backtester)
+
+(cell 3)
+
+======================================================================
+📄 core/backtesting/optimizer.py SOURCE CODE:
+======================================================================
+import datetime
+import logging
+import os.path
+import subprocess
+import traceback
+from abc import ABC, abstractmethod
+from typing import List, Optional, Type, Dict
+
+import optuna
+from dotenv import load_dotenv
+from hummingbot.strategy_v2.backtesting.backtesting_engine_base import BacktestingEngineBase
+from hummingbot.strategy_v2.controllers import ControllerConfigBase
+from pydantic import BaseModel
+
+from core.backtesting import BacktestingEngine
+from core.data_paths import data_paths
+from core.data_sources import CLOBDataSource
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class BacktestingConfig(BaseModel):
+    """
+    A simple data structure to hold the backtesting configuration.
+    """
+    config: ControllerConfigBase
+    start: int
+    end: int
+
+
+class BaseStrategyConfigGenerator(ABC):
+    """
+    Base class for generating strategy configurations for optimization.
+    Subclasses should implement the method to provide specific strategy configurations.
+    """
+
+
+    def __init__(self, start_date: datetime.datetime, end_date: datetime.datetime,
+                 config: Optional[Dict] = None):
+        """
+        Initialize with common parameters for backtesting.
+
+        Args:
+            start_date (datetime.datetime): The start date of the backtesting period.
+            end_date (datetime.datetime): The end date of the backtesting period.
+        """
+        self.start = int(start_date.timestamp())
+        self.end = int(end_date.timestamp())
+        if config:
+            self.config = config
+        else:
+            self.config = {}
+
+    def update_config(self, config):
+        self.config.update(config)
+
+    @abstractmethod
+    async def generate_config(self, trial) -> BacktestingConfig:
+        """
+        Generate the configuration for a given trial.
+        This method must be implemented by subclasses.
+
+        Args:
+            trial (optuna.Trial): The trial object containing hyperparameters to optimize.
+
+        Returns:
+            BacktestingConfig: An object containing the configuration, start time, and end time.
+        """
+        pass
+
+    async def generate_custom_configs(self) -> List[BacktestingConfig]:
+        """
+        Generate custom configurations for optimization.
+        This method must be implemented by subclasses.
+
+        Returns:
+            List[BacktestingConfig]: A list of objects containing the configuration, start time, and end time.
+        """
+        pass
+
+
+class StrategyOptimizer:
+    """
+    Class for optimizing trading strategies using Optuna and a backtesting engine.
+    """
+
+    def __init__(self, storage_name: Optional[str] = None,
+                 load_cached_data: bool = False, resolution: str = "1m", clob_source: Optional[CLOBDataSource] = None,
+                 custom_backtester: Optional[BacktestingEngineBase] = None):
+        """
+        Initialize the optimizer with a backtesting engine and database configuration.
+
+        Args:
+            storage_name (str): Optional storage name for Optuna study.
+            load_cached_data (bool): Whether to load cached backtesting data.
+            resolution (str): The resolution or time frame of the data (e.g., '1h', '1d').
+            clob_source (CLOBDataSource): CLOB data source for candles data retrieval.
+            custom_backtester (BacktestingEngineBase): Custom backtesting engine.
+        """
+        self._storage_name = storage_name if storage_name else self.get_storage_name(engine="sqlite")
+        self.dashboard_process = None
+        self.resolution = resolution
+        
+        # Lazy initialization - only create when needed
+        self._backtesting_engine = None
+        self._clob_source = None
+        
+        # Store initialization parameters for lazy loading
+        self._load_cached_data = load_cached_data
+        self._custom_backtester = custom_backtester
+        self._clob_source_param = clob_source
+
+    @classmethod
+    def get_storage_name(cls, engine, **kwargs):
+        if engine == "sqlite":
+            # Use centralized data paths
+            database_name = kwargs.get("database_name", "optimization_database")
+            path = data_paths.get_backtesting_db_path(f"{database_name}.db")
+            return f"sqlite:///{path}"
+        elif engine == "postgres":
+            db_host = kwargs.get("db_host", "localhost")
+            db_port = kwargs.get("db_port", 5432)
+            db_user = kwargs.get("db_user", "admin")
+            db_pass = kwargs.get("db_pass", "admin")
+            database_name = kwargs.get("database_name", "optimization_database")
+            return f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}:{db_port}/{database_name}"
+
+    @property
+    def backtesting_engine(self):
+        """Lazy-loaded backtesting engine."""
+        if self._backtesting_engine is None:
+            self._backtesting_engine = BacktestingEngine(
+                load_cached_data=self._load_cached_data,
+                custom_backtester=self._custom_backtester
+            )
+        return self._backtesting_engine
+    
+    @property
+    def clob_source(self):
+        """Lazy-loaded CLOB data source."""
+        if self._clob_source is None:
+            self._clob_source = self._clob_source_param or CLOBDataSource()
+        return self._clob_source
+
+    def load_candles_cache_by_connector_pair(self, connector_name: str, trading_pair: str):
+        """
+        Load the cached candles data for a given connector and trading pair.
+
+        Args:
+            connector_name (str): The name of the connector.
+            trading_pair (str): The trading pair.
+        """
+        self.backtesting_engine.load_candles_cache_by_connector_pair(connector_name, trading_pair)
+
+    def get_all_study_names(self):
+        """
+        Get all the study names available in the database.
+
+        Returns:
+            List[str]: A list of study names.
+        """
+        return optuna.get_all_study_names(self._storage_name)
+
+    def get_study(self, study_name: str):
+        """
+        Get the study object for a given study name.
+
+        Args:
+            study_name (str): The name of the study.
+
+        Returns:
+            optuna.Study: The study object.
+        """
+        return optuna.load_study(study_name=study_name, storage=self._storage_name)
+
+    def get_study_trials_df(self, study_name: str):
+        """
+        Get the trials data frame for a given study name.
+
+        Args:
+            study_name (str): The name of the study.
+
+        Returns:
+            pd.DataFrame: A pandas DataFrame containing the trials data.
+        """
+        study = self.get_study(study_name)
+        df = study.trials_dataframe()
+        df.dropna(inplace=True)
+        # Renaming the columns that start with 'user_attrs_'
+        df.rename(columns={col: col.replace('user_attrs_', '') for col in df.columns if col.startswith('user_attrs_')},
+                  inplace=True)
+        df.rename(columns={col: col.replace('params_', '') for col in df.columns if col.startswith('params_')}, )
+        return df
+
+    def get_study_best_params(self, study_name: str):
+        """
+        Get the best parameters for a given study name.
+
+        Args:
+            study_name (str): The name of the study.
+
+        Returns:
+            Dict[str, Any]: A dictionary containing the best parameters.
+        """
+        study = self.get_study(study_name)
+        return study.best_params
+
+    def _create_study(self, study_name: str, direction: str = "maximize", load_if_exists: bool = True) -> optuna.Study:
+        """
+        Create or load an Optuna study for optimization.
+
+        Args:
+            study_name (str): The name of the study.
+            direction (str): Direction of optimization ("maximize" or "minimize").
+            load_if_exists (bool): Whether to load an existing study if available.
+
+        Returns:
+            optuna.Study: The created or loaded study.
+        """
+        logger.info("About to create a study...")
+        return optuna.create_study(
+            direction=direction,
+            study_name=study_name,
+            storage=self._storage_name,
+            sampler=optuna.samplers.TPESampler(),
+            load_if_exists=load_if_exists
+        )
+
+    async def optimize(self, study_name: str, config_generator: Type[BaseStrategyConfigGenerator], n_trials: int = 100,
+                       load_if_exists: bool = True):
+        """
+        Run the optimization process asynchronously.
+
+        Args:
+            study_name (str): The name of the study.
+            config_generator (Type[BaseStrategyConfigGenerator]): A configuration generator class instance.
+            n_trials (int): Number of trials to run for optimization.
+            load_if_exists (bool): Whether to load an existing study if available.
+        """
+        study = self._create_study(study_name, load_if_exists=load_if_exists)
+        logger.info("About to start optimizing...")
+        await self._optimize_async(study, config_generator, n_trials=n_trials)
+
+    async def optimize_custom_configs(self, study_name: str, config_generator: Type[BaseStrategyConfigGenerator],
+                                      load_if_exists: bool = True):
+        """
+        Run the optimization process asynchronously using custom configurations.
+
+        Args:
+            study_name (str): The name of the study.
+            config_generator (Type[BaseStrategyConfigGenerator]): A configuration generator class instance.
+            load_if_exists (bool): Whether to load an existing study if available.
+        """
+        study = self._create_study(study_name, load_if_exists=load_if_exists)
+        await self._optimize_async_custom_configs(study, config_generator)
+
+    async def _optimize_async(self, study: optuna.Study, config_generator: Type[BaseStrategyConfigGenerator],
+                              n_trials: int):
+        """
+        Asynchronously optimize using the provided study and configuration generator.
+
+        Args:
+            study (optuna.Study): The study to use for optimization.
+            config_generator (Type[BaseStrategyConfigGenerator]): A configuration generator class instance.
+            n_trials (int): Number of trials to run for optimization.
+        """
+        for _ in range(n_trials):
+            trial = study.ask()
+
+            try:
+                # Run the async objective function and get the result
+                value = await self._async_objective(trial, config_generator)
+
+                # Report the result back to the study
+                study.tell(trial, value)
+
+            except Exception as e:
+                print(f"Error in _optimize_async: {str(e)}")
+                study.tell(trial, state=optuna.trial.TrialState.FAIL)
+
+    async def _optimize_async_custom_configs(self, study: optuna.Study,
+                                             config_generator: Type[BaseStrategyConfigGenerator]):
+        """
+        Asynchronously optimize using the provided study and configuration generator.
+
+        Args:
+            study (optuna.Study): The study to use for optimization.
+            config_generator (Type[BaseStrategyConfigGenerator]): A configuration generator class instance.
+            n_trials (int): Number of trials to run for optimization.
+        """
+        backtesting_configs = config_generator.generate_custom_configs()
+        # Load cached data
+        self.clob_source.load_candles_cache()
+        for bt_config in backtesting_configs:
+            trial = study.ask()
+            try:
+                connector_name = bt_config.config.connector_name
+                trading_pair = bt_config.config.trading_pair
+                start = bt_config.start
+                end = bt_config.end
+
+                trial.set_user_attr("config", bt_config.config.json())
+                trial.set_user_attr("start_bt", start)
+                trial.set_user_attr("end_bt", end)
+                candles = await self.clob_source.get_candles(connector_name,
+                                                               trading_pair,
+                                                               self.resolution, start, end)
+                self.backtesting_engine._dt_bt.backtesting_data_provider.candles_feeds[
+                    f"{connector_name}_{trading_pair}_{self.resolution}"] = candles.data
+                self.backtesting_engine._mm_bt.backtesting_data_provider.candles_feeds[
+                    f"{connector_name}_{trading_pair}_{self.resolution}"] = candles.data
+                config_generator.backtester.backtesting_data_provider.candles_feeds[
+                    f"{connector_name}_{trading_pair}_{self.resolution}"] = candles.data
+                start = candles.data["timestamp"].min()
+                end = candles.data["timestamp"].max()
+                # Generate configuration using the config generator
+                backtesting_result = await self.backtesting_engine.run_backtesting(
+                    config=bt_config.config,
+                    start=start,
+                    end=end,
+                    backtesting_resolution=self.resolution,
+                )
+                strategy_analysis = backtesting_result.results
+
+                for key, value in strategy_analysis.items():
+                    trial.set_user_attr(key, value)
+                executors_df = backtesting_result.executors_df.copy()
+                trial.set_user_attr("executors", executors_df.to_json())
+                executors_df["close_type"] = executors_df["close_type"].apply(lambda x: x.name)
+                executors_df["status"] = executors_df["status"].apply(lambda x: x.name)
+
+                # Return the value you want to optimize
+                value = strategy_analysis["net_pnl"]
+            except Exception as e:
+                print(f"An error occurred during optimization: {str(e)}")
+                traceback.print_exc()
+                value = float('-inf')  # Return a very low value to indicate failure
+
+            # Report the result back to the study
+            study.tell(trial, value)
+
+    async def _async_objective(self, trial: optuna.Trial, config_generator: Type[BaseStrategyConfigGenerator]) -> float:
+        """
+        The asynchronous objective function for a given trial.
+
+        Args:
+            trial (optuna.Trial): The trial object containing hyperparameters.
+            config_generator (Type[BaseStrategyConfigGenerator]): A configuration generator class instance.
+
+        Returns:
+            float: The objective value to be optimized.
+        """
+        try:
+            # Generate configuration using the config generator
+            backtesting_config = await config_generator.generate_config(trial)
+
+            # Await the backtesting result
+            backtesting_result = await self.backtesting_engine.run_backtesting(
+                config=backtesting_config.config,
+                start=backtesting_config.start,
+                end=backtesting_config.end,
+                backtesting_resolution=self.resolution,
+            )
+            strategy_analysis = backtesting_result.results
+
+            for key, value in strategy_analysis.items():
+                trial.set_user_attr(key, value)
+            trial.set_user_attr("config", backtesting_result.controller_config.json())
+            executors_df = backtesting_result.executors_df.copy()
+            executors_df["close_type"] = executors_df["close_type"].apply(lambda x: x.name)
+            executors_df["status"] = executors_df["status"].apply(lambda x: x.name)
+            executors_df.drop(columns=["config"], inplace=True)
+            trial.set_user_attr("executors", executors_df.to_json())
+
+            # Return the value you want to optimize
+            return strategy_analysis["sharpe_ratio"]
+        except Exception as e:
+            print(f"An error occurred during optimization: {str(e)}")
+            traceback.print_exc()
+            return float('-inf')  # Return a very low value to indicate failure
+
+    def launch_optuna_dashboard(self):
+        """
+        Launch the Optuna dashboard for visualization.
+        """
+        self.dashboard_process = subprocess.Popen(["optuna-dashboard", self._storage_name])
+
+    def kill_optuna_dashboard(self):
+        """
+        Kill the Optuna dashboard process.
+        """
+        if self.dashboard_process and self.dashboard_process.poll() is None:
+            self.dashboard_process.terminate()  # Graceful termination
+            self.dashboard_process.wait()  # Wait for process to terminate
+            self.dashboard_process = None  # Reset process handle
+        else:
+            print("Dashboard is not running or already terminated.")
+
+(cell 4)
+
+======================================================================
+📄 app/controllers/market_making/__init__.py:
+======================================================================
+
+
+======================================================================
+📄 app/__init__.py:
+======================================================================
+"""
+QuantsLab Application Layer
+
+This package contains the application-specific implementations built on top of the core framework:
+- tasks: Task implementations for data collection, backtesting, and reporting
+- controllers: Trading strategy controllers
+- cli: Command-line interface for task management
+"""
+
+__version__ = "2.0.0"
+
+======================================================================
+📄 app/controllers/__init__.py:
+======================================================================
+
+(cell 5)
+
+✅ Example backtest notebook found!
+
+
+──────────────────────────────────────────────────────────────────────
+Cell [0] - code
+──────────────────────────────────────────────────────────────────────
+import warnings
+
+warnings.filterwarnings("ignore")
+
+from core.backtesting import BacktestingEngine
+
+backtesting = BacktestingEngine(load_cached_data=False)
+
+──────────────────────────────────────────────────────────────────────
+Cell [1] - code
+──────────────────────────────────────────────────────────────────────
+from app.controllers.market_making.pmm_simple import PMMSimpleConfig
+from hummingbot.strategy_v2.utils.distributions import Distributions
+from hummingbot.strategy_v2.executors.position_executor.data_types import TrailingStop
+import datetime
+from decimal import Decimal
+
+# Controller configuration
+connector_name = "binance"
+trading_pair = "BTC-USDT"
+total_amount_quote = 1000
+take_profit = 0.003
+stop_loss = 0.003
+trailing_stop_activation_price = 0.001
+trailing_stop_trailing_delta = 0.0005
+time_limit = 60 * 60 * 2
+executor_refresh_time = 60 * 2
+cooldown_time = 60 * 60 * 2
+
+# Backtesting configuration
+start = int(datetime.datetime(2024, 8, 1).timestamp())
+end = int(datetime.datetime(2024, 8, 2).timestamp())
+backtesting_resolution = "1m"
+
+# Creating the instance of the configuration and the controller
+config = PMMSimpleConfig(
+    connector_name=connector_name,
+    trading_pair=trading_pair,
+    sell_spreads=Distributions.arithmetic(3, 0.002, 0.001),
+    buy_spreads=Distributions.arithmetic(3, 0.002, 0.001),
+    buy_amounts_pct=Distributions.arithmetic(3, 0.01, 0.01),
+    sell_amounts_pct=Distributions.arithmetic(3, 0.01, 0.01),
+    total_amount_quote=Decimal(total_amount_quote),
+    take_profit=Decimal(take_profit),
+    stop_loss=Decimal(stop_loss),
+    trailing_stop=TrailingStop(activation_price=Decimal(trailing_stop_activation_price), trailing_delta=Decimal(trailing_stop_trailing_delta)),
+    time_limit=time_limit,
+    cooldown_time=cooldown_time,
+    executor_refresh_time=executor_refresh_time
+)
+
+──────────────────────────────────────────────────────────────────────
+Cell [2] - code
+──────────────────────────────────────────────────────────────────────
+# Running the backtesting this will output a backtesting result object that has built in methods to visualize the results
+
+backtesting_result = await backtesting.run_backtesting(config, start, end, backtesting_resolution)
+
+──────────────────────────────────────────────────────────────────────
+Cell [3] - code
+──────────────────────────────────────────────────────────────────────
+# Let's see what is inside the backtesting results
+print(backtesting_result.get_results_summary())
+backtesting_result.get_backtesting_figure()
+
+──────────────────────────────────────────────────────────────────────
+Cell [4] - code
+──────────────────────────────────────────────────────────────────────
+# 2. The executors dataframe: this is the dataframe that contains the information of the orders that were executed
+import pandas as pd
+
+executors_df = backtesting_result.executors_df
+executors_df.head()
+
+──────────────────────────────────────────────────────────────────────
+Cell [7] - code
+──────────────────────────────────────────────────────────────────────
+import plotly.express as px
+
+# Create a new column for profitability
+executors_df['profitable'] = executors_df['net_pnl_quote'] > 0
+
+# Create the scatter plot
+fig = px.scatter(
+    executors_df,
+    x="timestamp",
+    y='net_pnl_quote',
+    title='PNL per Trade',
+    color='profitable',
+    color_discrete_map={True: 'green', False: 'red'},
+    labels={'timestamp': 'Timestamp', 'net_pnl_quote': 'Net PNL (Quote)'},
+    hover_data=['filled_amount_quote', 'side']
+)
+
+# Customize the layout
+fig.update_layout(
+    xaxis_title="Timestamp",
+    yaxis_title="Net PNL (Quote)",
+    legend_title="Profitable",
+    font=dict(size=12, color="white"),
+    showlegend=False,
+    plot_bgcolor='rgba(0,0,0,0.8)',  # Dark background
+    paper_bgcolor='rgba(0,0,0,0.8)',  # Dark background for the entire plot area
+    xaxis=dict(gridcolor="gray"),
+    yaxis=dict(gridcolor="gray")
+)
+
+# Add a horizontal line at y=0 to clearly separate profits and losses
+fig.add_hline(y=0, line_dash="dash", line_color="lightgray")
+
+# Show the plot
+fig.show()
+
+──────────────────────────────────────────────────────────────────────
+Cell [9] - code
+──────────────────────────────────────────────────────────────────────
+fig = px.histogram(executors_df, x='net_pnl_quote', title='PNL Distribution')
+fig.show()
